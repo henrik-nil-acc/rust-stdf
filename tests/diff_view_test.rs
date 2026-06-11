@@ -97,3 +97,108 @@ fn read_record_matches_record_iter() {
         );
     }
 }
+
+// read_view must yield the same records as get_record_iter, over both the
+// borrow fast-path (uncompressed) and the copy fallback (compressed).
+#[test]
+fn read_view_matches_record_iter() {
+    let mut base = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    base.push("demo_stdf");
+    for name in ["lot2.stdf", "lot2.stdf.gz"] {
+        let path = base.join(name);
+        let p = path.display().to_string();
+
+        let mut r1 = StdfReader::new(&path).unwrap_or_else(|e| panic!("cannot open {p}: {e}"));
+        let legacy: Vec<String> = r1
+            .get_record_iter()
+            .map(|r| format!("{:?}", r.expect("read error")))
+            .collect();
+
+        let mut r2 = StdfReader::new(&path).unwrap_or_else(|e| panic!("cannot open {p}: {e}"));
+        let mut viewed: Vec<String> = Vec::with_capacity(legacy.len());
+        while let Some(res) = r2.read_view() {
+            let view = res.expect("read error while streaming views");
+            viewed.push(format!("{:?}", view.into_owned()));
+        }
+
+        assert!(!legacy.is_empty(), "no records read from {p}");
+        assert_eq!(legacy.len(), viewed.len(), "{p}: record count differs");
+        for (i, (a, b)) in legacy.iter().zip(&viewed).enumerate() {
+            assert_eq!(
+                a, b,
+                "{p}: record #{i} differs (read_view vs get_record_iter)"
+            );
+        }
+        eprintln!(
+            "{p}: {} records matched (read_view vs get_record_iter)",
+            legacy.len()
+        );
+    }
+}
+
+// A tiny BufReader forces records across the buffer boundary, deterministically
+// exercising read_view's copy fallback on the uncompressed path.
+#[test]
+fn read_view_straddle_fallback() {
+    use rust_stdf::CompressType;
+    use std::fs::File;
+    use std::io::BufReader;
+
+    let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    path.push("demo_stdf");
+    path.push("lot2.stdf");
+
+    let mut r1 = StdfReader::new(&path).unwrap();
+    let legacy: Vec<String> = r1
+        .get_record_iter()
+        .map(|r| format!("{:?}", r.expect("read error")))
+        .collect();
+
+    let br = BufReader::with_capacity(16, File::open(&path).unwrap());
+    let mut r2 = StdfReader::from(br, &CompressType::Uncompressed).unwrap();
+    let mut viewed: Vec<String> = Vec::with_capacity(legacy.len());
+    while let Some(res) = r2.read_view() {
+        viewed.push(format!("{:?}", res.expect("read error").into_owned()));
+    }
+
+    assert_eq!(legacy.len(), viewed.len(), "straddle: record count differs");
+    for (i, (a, b)) in legacy.iter().zip(&viewed).enumerate() {
+        assert_eq!(a, b, "straddle: record #{i} differs");
+    }
+    eprintln!("straddle fallback: {} records matched", legacy.len());
+}
+
+// Switching from read_view to the owned iterator mid-stream must continue
+// correctly, i.e. the deferred consume is settled by the next read_header.
+#[test]
+fn read_view_interleaves_with_owned_reader() {
+    let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    path.push("demo_stdf");
+    path.push("lot2.stdf");
+
+    let mut r1 = StdfReader::new(&path).unwrap();
+    let full: Vec<String> = r1
+        .get_record_iter()
+        .map(|r| format!("{:?}", r.expect("read error")))
+        .collect();
+
+    let mut r2 = StdfReader::new(&path).unwrap();
+    let mut mixed: Vec<String> = Vec::with_capacity(full.len());
+    // first 100 records via read_view (leaves a deferred consume pending)
+    for _ in 0..100 {
+        match r2.read_view() {
+            Some(res) => mixed.push(format!("{:?}", res.expect("read error").into_owned())),
+            None => break,
+        }
+    }
+    // the rest via the owned iterator
+    for rec in r2.get_record_iter() {
+        mixed.push(format!("{:?}", rec.expect("read error")));
+    }
+
+    assert_eq!(full.len(), mixed.len(), "interleave: record count differs");
+    for (i, (a, b)) in full.iter().zip(&mixed).enumerate() {
+        assert_eq!(a, b, "interleave: record #{i} differs");
+    }
+    eprintln!("interleave: {} records matched", full.len());
+}

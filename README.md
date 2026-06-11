@@ -80,20 +80,23 @@ fn main() {
 ## Borrowed record views
 
 `get_record_iter` yields owned `StdfRecord`s, allocating a `String` for every
-text field. To inspect records without that allocation, read into a reusable
-buffer and borrow it as a `RecordView`: scalar text fields become `Cow<str>`
-borrowed straight from the record bytes (allocating only for non-ASCII). Call
-`into_owned()` when you need to keep a record past the next read.
+text field. `read_view` instead borrows each record straight from the reader's
+buffer as a `RecordView`, with scalar text fields exposed as `Cow<str>` that
+borrow in place for ASCII. The common path does no per-record copy and no
+string allocation, though array fields still allocate their vectors. The view
+is valid until the next read. Call `into_owned()` on the records you keep.
 
 ```rust
-use rust_stdf::{stdf_file::*, RawDataElement, RecordView};
+use rust_stdf::{stdf_file::*, RecordView};
 
 let mut reader = StdfReader::new("demo_file.stdf").unwrap();
-let mut raw = RawDataElement::default();
-while reader.read_record(&mut raw).unwrap() {
-    if let RecordView::PTR(ptr) = raw.view() {
-        // `ptr.test_txt` borrows from `raw`; no per-record allocation
+while let Some(rec) = reader.read_view() {
+    if let RecordView::PTR(ptr) = rec.unwrap() {
+        // `ptr.test_txt` borrows from the reader buffer, no string allocation
         println!("{} = {}", ptr.test_txt, ptr.result);
     }
 }
 ```
+
+To own the raw bytes (e.g. to keep `offset`/`header`), use
+`read_record(&mut RawDataElement)` then `raw.view()`.

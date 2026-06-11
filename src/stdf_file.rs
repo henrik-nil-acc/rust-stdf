@@ -11,6 +11,7 @@
 
 use crate::stdf_error::StdfError;
 use crate::stdf_types::*;
+use crate::stdf_view::RecordView;
 #[cfg(feature = "bzip")]
 use bzip2::bufread::BzDecoder;
 #[cfg(feature = "gzip")]
@@ -101,6 +102,11 @@ pub(crate) enum StdfStream<R> {
 pub struct StdfReader<R> {
     endianness: ByteOrder,
     stream: StdfStream<R>,
+    // read_view copy buffer for records it cannot borrow (compressed/straddling)
+    view_fallback: Vec<u8>,
+    // read_view bytes to consume on the next read_header (deferred so the view
+    // can borrow them)
+    pending_consume: usize,
 }
 
 pub struct RecordIter<'a, R> {
@@ -190,11 +196,23 @@ impl<R: BufRead + Seek> StdfReader<R> {
         //
         stream = rewind_stream_position(stream)?;
 
-        Ok(StdfReader { endianness, stream })
+        Ok(StdfReader {
+            endianness,
+            stream,
+            view_fallback: Vec::new(),
+            pending_consume: 0,
+        })
     }
 
     #[inline(always)]
     fn read_header(&mut self) -> Result<RecordHeader, StdfError> {
+        // advance past a record a previous read_view borrowed but left unconsumed
+        if self.pending_consume != 0 {
+            if let StdfStream::Binary(br) = &mut self.stream {
+                br.consume(self.pending_consume);
+            }
+            self.pending_consume = 0;
+        }
         let mut buf = [0u8; 4];
         self.stream.read_exact(&mut buf)?;
         RecordHeader::new().read_from_bytes(&buf, &self.endianness)
@@ -256,6 +274,79 @@ impl<R: BufRead + Seek> StdfReader<R> {
         rec.header = header;
         rec.byte_order = self.endianness;
         Ok(true)
+    }
+
+    /// Borrow the next record straight from the reader's buffer as a
+    /// [`RecordView`], with no per-record copy. The view is valid until the
+    /// next read (it borrows `self`). Falls back to copying into an internal
+    /// reused buffer only when the record spans the `BufReader` boundary or the
+    /// stream is compressed.
+    ///
+    /// Returns `None` at end of file, `Some(Err(..))` on a read error, and
+    /// `Some(Ok(view))` otherwise. This is the lowest-overhead way to stream:
+    /// on the common path no per-record copy and no string allocation, though
+    /// array fields still allocate. Call [`RecordView::into_owned`] on the ones
+    /// you need to keep.
+    ///
+    /// ```no_run
+    /// use rust_stdf::{stdf_file::*, RecordView};
+    ///
+    /// let mut reader = StdfReader::new("demo_file.stdf").unwrap();
+    /// while let Some(rec) = reader.read_view() {
+    ///     if let RecordView::PTR(ptr) = rec.unwrap() {
+    ///         println!("{} = {}", ptr.test_txt, ptr.result);
+    ///     }
+    /// }
+    /// ```
+    #[inline]
+    pub fn read_view(&mut self) -> Option<Result<RecordView<'_>, StdfError>> {
+        let header = match self.read_header() {
+            Ok(h) => h,
+            // code 4 is a normal EOF, anything else is a real read error
+            Err(e) => return if e.code == 4 { None } else { Some(Err(e)) },
+        };
+        let len = header.len as usize;
+        let order = self.endianness;
+
+        // is the whole record buffered? probe first, releasing the borrow
+        let buffered = match &mut self.stream {
+            StdfStream::Binary(br) => match br.fill_buf() {
+                Ok(b) => b.len() >= len,
+                Err(io_e) => return Some(Err(io_e.into())),
+            },
+            _ => false,
+        };
+
+        // copy fallback first and return, so the borrow below is self's last use
+        if !buffered {
+            if self.view_fallback.len() < len {
+                self.view_fallback.resize(len, 0);
+            }
+            // a short read after a valid header is a truncated record, not a
+            // clean EOF, so report it as a read error like the owned readers
+            if let Err(io_e) = self.stream.read_exact(&mut self.view_fallback[..len]) {
+                return Some(Err(StdfError {
+                    code: 3,
+                    msg: io_e.to_string(),
+                }));
+            }
+            self.view_fallback.truncate(len);
+            return Some(Ok(RecordView::from_bytes(
+                header,
+                &self.view_fallback,
+                &order,
+            )));
+        }
+
+        // the returned view holds these bytes, so consume on the next read_header
+        self.pending_consume = len;
+        match &mut self.stream {
+            StdfStream::Binary(br) => match br.fill_buf() {
+                Ok(buf) => Some(Ok(RecordView::from_bytes(header, &buf[..len], &order))),
+                Err(io_e) => Some(Err(io_e.into())),
+            },
+            _ => unreachable!("buffered implies the binary stream"),
+        }
     }
 
     /// return an iterator for unprocessed STDF bytes
