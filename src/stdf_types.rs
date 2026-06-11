@@ -2494,6 +2494,20 @@ impl RawDataElement {
     }
 }
 
+impl Default for RawDataElement {
+    /// An empty element, suitable as a reusable buffer for
+    /// [`StdfReader::read_record`](crate::stdf_file::StdfReader::read_record).
+    #[inline(always)]
+    fn default() -> Self {
+        RawDataElement {
+            offset: 0,
+            header: RecordHeader::default(),
+            raw_data: Vec::new(),
+            byte_order: ByteOrder::LittleEndian,
+        }
+    }
+}
+
 impl From<&RawDataElement> for StdfRecord {
     /// it will NOT consume the input RawDataElement
     #[inline(always)]

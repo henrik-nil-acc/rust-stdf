@@ -6,6 +6,7 @@
 //!  - Reading & parsing STDF files.
 //!  - Reading & parsing ATDF files. (feature: `atdf`)
 //!  - Support several compressed formats.
+//!  - Borrowed record views ([`RecordView`]) that skip per-record string allocation.
 //!
 //! Available features:
 //!  - `gzip`: gzip compression (.gz) support powered by `flate2`
@@ -34,12 +35,14 @@ extern crate smart_default;
 mod atdf_types;
 mod stdf_error;
 mod stdf_types;
+mod stdf_view;
 pub use stdf_types::*;
+pub use stdf_view::*;
 
 /// This module contains STDF Reader
 /// and record iterator
 ///
-/// For more detailed example, see [`StdfReader`].
+/// For more detailed example, see [`StdfReader`](crate::stdf_file::StdfReader).
 pub mod stdf_file;
 
 /// This module contains ATDF Reader
@@ -506,6 +509,59 @@ mod tests {
             "42°C¿ÿ".to_string(),
             stdf_types::read_cn(&raw_data_latin, &mut 0)
         );
+    }
+
+    #[test]
+    fn test_read_cn_str() {
+        // ASCII payloads borrow, with the same value and cursor advance as read_cn
+        let raw_data: [u8; 9] = [7, 84, 101, 115, 116, 32, 79, 75, 0];
+        let expect_pos = |p: usize| std::cmp::min(1 + p + raw_data[p] as usize, raw_data.len());
+        let mut pos = 0;
+        let v = stdf_view::read_cn_str(&raw_data, &mut pos);
+        assert_eq!(&*v, "Test OK");
+        assert!(
+            matches!(&v, std::borrow::Cow::Borrowed(_)),
+            "ASCII payload should borrow"
+        );
+        assert_eq!(pos, expect_pos(0));
+        // a count larger than the remaining bytes is clamped, same as read_cn
+        let mut pos = 4;
+        assert_eq!(&*stdf_view::read_cn_str(&raw_data, &mut pos), " OK\0");
+        assert_eq!(pos, expect_pos(4));
+        // zero count yields a borrowed empty string
+        let mut pos = 8;
+        let v = stdf_view::read_cn_str(&raw_data, &mut pos);
+        assert_eq!(&*v, "");
+        assert!(matches!(&v, std::borrow::Cow::Borrowed(_)));
+        assert_eq!(pos, expect_pos(8));
+        // non-ASCII allocates and reproduces the owned Latin-1 mapping
+        let raw_data_latin: [u8; 7] = [6, 52, 50, 176, 67, 191, 255];
+        let v = stdf_view::read_cn_str(&raw_data_latin, &mut 0);
+        assert_eq!(&*v, stdf_types::read_cn(&raw_data_latin, &mut 0).as_str());
+        assert!(
+            matches!(&v, std::borrow::Cow::Owned(_)),
+            "non-ASCII payload should allocate"
+        );
+    }
+
+    #[test]
+    fn test_read_sn_str() {
+        let order = ByteOrder::LittleEndian;
+        // ASCII payload borrows, value and cursor match read_sn
+        let raw_data: [u8; 10] = [7, 0, 84, 101, 115, 116, 32, 79, 75, 0];
+        let mut pos = 0;
+        let v = stdf_view::read_sn_str(&raw_data, &mut pos, &order);
+        assert_eq!(&*v, "Test OK");
+        assert!(matches!(&v, std::borrow::Cow::Borrowed(_)));
+        assert_eq!(pos, 9);
+        // non-ASCII allocates and reproduces the owned Latin-1 mapping
+        let raw_latin: [u8; 5] = [3, 0, 176, 191, 255];
+        let v = stdf_view::read_sn_str(&raw_latin, &mut 0, &order);
+        assert_eq!(
+            &*v,
+            stdf_types::read_sn(&raw_latin, &mut 0, &order).as_str()
+        );
+        assert!(matches!(&v, std::borrow::Cow::Owned(_)));
     }
 
     #[test]

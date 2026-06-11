@@ -212,6 +212,52 @@ impl<R: BufRead + Seek> StdfReader<R> {
         }
     }
 
+    /// Read the next record's header and field data into a reusable
+    /// [`RawDataElement`], reusing its existing buffer allocation.
+    ///
+    /// Returns `Ok(true)` after `rec` has been filled, `Ok(false)` at end of
+    /// file, and `Err` on a read error. The caller can then borrow the bytes
+    /// with [`RawDataElement::view`], which borrows scalar strings instead of
+    /// allocating, or convert into an owned [`StdfRecord`]. On `Err`, the
+    /// contents of `rec` are unspecified. `offset` is not tracked here; use
+    /// [`get_rawdata_iter`](Self::get_rawdata_iter) when file offsets matter.
+    ///
+    /// ```no_run
+    /// use rust_stdf::{stdf_file::*, RawDataElement, RecordView};
+    ///
+    /// let mut reader = StdfReader::new("demo_file.stdf").unwrap();
+    /// let mut raw = RawDataElement::default();
+    /// while reader.read_record(&mut raw).unwrap() {
+    ///     if let RecordView::PTR(ptr) = raw.view() {
+    ///         println!("{} = {}", ptr.test_txt, ptr.result);
+    ///     }
+    /// }
+    /// ```
+    #[inline(always)]
+    pub fn read_record(&mut self, rec: &mut RawDataElement) -> Result<bool, StdfError> {
+        let header = match self.read_header() {
+            Ok(h) => h,
+            // code = 4 is a normal EOF, anything else is a real read error
+            Err(e) => return if e.code == 4 { Ok(false) } else { Err(e) },
+        };
+        let len = header.len as usize;
+        if rec.raw_data.len() < len {
+            rec.raw_data.resize(len, 0);
+        }
+        if let Err(io_e) = self.stream.read_exact(&mut rec.raw_data[..len]) {
+            return Err(StdfError {
+                code: 3,
+                msg: io_e.to_string(),
+            });
+        }
+        // keep only this record's bytes so view() sees exactly them
+        rec.raw_data.truncate(len);
+        rec.offset = 0;
+        rec.header = header;
+        rec.byte_order = self.endianness;
+        Ok(true)
+    }
+
     /// return an iterator for unprocessed STDF bytes
     ///
     /// beware that internal `offset` counter is starting

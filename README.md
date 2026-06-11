@@ -76,3 +76,24 @@ fn main() {
             continuity_rlt);
 }
 ```
+
+## Borrowed record views
+
+`get_record_iter` yields owned `StdfRecord`s, allocating a `String` for every
+text field. To inspect records without that allocation, read into a reusable
+buffer and borrow it as a `RecordView`: scalar text fields become `Cow<str>`
+borrowed straight from the record bytes (allocating only for non-ASCII). Call
+`into_owned()` when you need to keep a record past the next read.
+
+```rust
+use rust_stdf::{stdf_file::*, RawDataElement, RecordView};
+
+let mut reader = StdfReader::new("demo_file.stdf").unwrap();
+let mut raw = RawDataElement::default();
+while reader.read_record(&mut raw).unwrap() {
+    if let RecordView::PTR(ptr) = raw.view() {
+        // `ptr.test_txt` borrows from `raw`; no per-record allocation
+        println!("{} = {}", ptr.test_txt, ptr.result);
+    }
+}
+```
