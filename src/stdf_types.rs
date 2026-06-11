@@ -2617,7 +2617,7 @@ pub(crate) fn read_cn(raw_data: &[u8], pos: &mut usize) -> Cn {
     let mut value = String::default();
     if count != 0 {
         let min_pos = std::cmp::min(*pos + count, raw_data.len());
-        value = bytes_to_string(&raw_data[*pos..min_pos]);
+        value = cn_string(&raw_data[*pos..min_pos]);
         *pos = min_pos;
     }
     value
@@ -2630,7 +2630,7 @@ pub(crate) fn read_sn(raw_data: &[u8], pos: &mut usize, order: &ByteOrder) -> Sn
     let mut value = String::default();
     if count != 0 {
         let min_pos = std::cmp::min(*pos + count, raw_data.len());
-        value = bytes_to_string(&raw_data[*pos..min_pos]);
+        value = cn_string(&raw_data[*pos..min_pos]);
         *pos = min_pos;
     }
     value
@@ -2819,4 +2819,25 @@ pub(crate) fn read_vn(raw_data: &[u8], pos: &mut usize, order: &ByteOrder, k: u1
 #[inline(always)]
 pub(crate) fn bytes_to_string(data: &[u8]) -> String {
     data.iter().map(|&x| x as char).collect()
+}
+
+/// `bytes` as `&str` when pure ASCII, else `None`. ASCII is valid UTF-8, so
+/// this skips the scan a safe `from_utf8` would repeat after `is_ascii`.
+/// Becomes the safe `<[u8]>::as_ascii().as_str()` once that stabilises (#110998).
+#[inline(always)]
+pub(crate) fn ascii_str(bytes: &[u8]) -> Option<&str> {
+    // SAFETY: the closure runs only when every byte is < 0x80 (valid UTF-8).
+    bytes
+        .is_ascii()
+        .then(|| unsafe { std::str::from_utf8_unchecked(bytes) })
+}
+
+/// Owned `String` from STDF text bytes. ASCII copies directly, non-ASCII takes
+/// the Latin-1 path. Identical result to `bytes_to_string`.
+#[inline(always)]
+pub(crate) fn cn_string(data: &[u8]) -> String {
+    match ascii_str(data) {
+        Some(s) => s.to_owned(),
+        None => bytes_to_string(data),
+    }
 }
